@@ -18,6 +18,7 @@ import dask
 from dask.core import istask
 from dask.compatibility import apply
 from dask.utils import format_bytes, funcname
+from dask.system import CPU_COUNT
 
 try:
     from cytoolz import pluck, partial, merge, first, keymap
@@ -462,7 +463,7 @@ class Worker(ServerNode):
             warnings.warn("the ncores= parameter has moved to nthreads=")
             nthreads = ncores
 
-        self.nthreads = nthreads or system.CPU_COUNT
+        self.nthreads = nthreads or CPU_COUNT
         self.total_resources = resources or {}
         self.available_resources = (resources or {}).copy()
         self.death_timeout = parse_timedelta(death_timeout)
@@ -3072,7 +3073,7 @@ class Reschedule(Exception):
     pass
 
 
-def parse_memory_limit(memory_limit, nthreads, total_cores=system.CPU_COUNT):
+def parse_memory_limit(memory_limit, nthreads, total_cores=CPU_COUNT):
     if memory_limit is None:
         return None
 
@@ -3143,11 +3144,18 @@ async def get_data_from_worker(
 
 job_counter = [0]
 
+import functools
+
+
+@functools.lru_cache(100)
+def cached_function_deserialization(func):
+    return pickle.loads(func)
+
 
 def _deserialize(function=None, args=None, kwargs=None, task=no_value):
     """ Deserialize task inputs and regularize to func, args, kwargs """
     if function is not None:
-        function = pickle.loads(function)
+        function = cached_function_deserialization(function)
     if args:
         args = pickle.loads(args)
     if kwargs:
