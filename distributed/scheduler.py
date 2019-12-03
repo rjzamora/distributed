@@ -57,6 +57,7 @@ from .utils import (
     parse_bytes,
     PeriodicCallback,
     shutting_down,
+    tmpfile,
 )
 from .utils_comm import scatter_to_workers, gather_from_workers
 from .utils_perf import enable_gc_diagnosis, disable_gc_diagnosis
@@ -1073,6 +1074,7 @@ class Scheduler(ServerNode):
             "processing": self.get_processing,
             "call_stack": self.get_call_stack,
             "profile": self.get_profile,
+            "performance_report": self.performance_report,
             "logs": self.get_logs,
             "worker_logs": self.get_worker_logs,
             "nbytes": self.get_nbytes,
@@ -1215,7 +1217,7 @@ class Scheduler(ServerNode):
                 c.cancel()
 
         if self.status != "running":
-            self.listen(self._start_address, listen_args=self.listen_args)
+            await self.listen(self._start_address, listen_args=self.listen_args)
             self.ip = get_address_host(self.listen_address)
             listen_ip = self.ip
 
@@ -1606,7 +1608,7 @@ class Scheduler(ServerNode):
                     else:
                         child_deps = self.dependencies[dep]
                     if all(d in done for d in child_deps):
-                        if dep in self.tasks:
+                        if dep in self.tasks and dep not in done:
                             done.add(dep)
                             stack.append(dep)
 
@@ -2547,7 +2549,7 @@ class Scheduler(ServerNode):
                 (self.tasks[key].state if key in self.tasks else None)
                 for key in missing_keys
             ]
-            logger.debug(
+            logger.exception(
                 "Couldn't gather keys %s state: %s workers: %s",
                 missing_keys,
                 missing_states,
@@ -2555,17 +2557,21 @@ class Scheduler(ServerNode):
             )
             result = {"status": "error", "keys": missing_keys}
             with log_errors():
+                # Remove suspicious workers from the scheduler but allow them to
+                # reconnect.
                 for worker in missing_workers:
-                    self.remove_worker(address=worker)  # this is extreme
+                    self.remove_worker(address=worker, close=False)
                 for key, workers in missing_keys.items():
-                    if not workers:
-                        continue
-                    ts = self.tasks[key]
+                    # Task may already be gone if it was held by a
+                    # `missing_worker`
+                    ts = self.tasks.get(key)
                     logger.exception(
                         "Workers don't have promised key: %s, %s",
                         str(workers),
                         str(key),
                     )
+                    if not workers or ts is None:
+                        continue
                     for worker in workers:
                         ws = self.workers.get(worker)
                         if ws is not None and ts in ws.has_what:
@@ -4619,6 +4625,8 @@ class Scheduler(ServerNode):
         self,
         comm=None,
         workers=None,
+        scheduler=False,
+        server=False,
         merge_workers=True,
         start=None,
         stop=None,
@@ -4628,8 +4636,15 @@ class Scheduler(ServerNode):
             workers = self.workers
         else:
             workers = set(self.workers) & set(workers)
+
+        if scheduler:
+            return profile.get_profile(self.io_loop.profile, start=start, stop=stop)
+
         results = await asyncio.gather(
-            *(self.rpc(w).profile(start=start, stop=stop, key=key) for w in workers)
+            *(
+                self.rpc(w).profile(start=start, stop=stop, key=key, server=server)
+                for w in workers
+            )
         )
 
         if merge_workers:
@@ -4685,6 +4700,77 @@ class Scheduler(ServerNode):
                 keys[k][-1][1] += v
 
         return {"counts": counts, "keys": keys}
+
+    async def performance_report(self, comm=None, start=None):
+        # Profiles
+        compute, scheduler, workers = await asyncio.gather(
+            *[
+                self.get_profile(start=start),
+                self.get_profile(scheduler=True, start=start),
+                self.get_profile(server=True, start=start),
+            ]
+        )
+        from . import profile
+
+        def profile_to_figure(state):
+            data = profile.plot_data(state)
+            figure, source = profile.plot_figure(data, sizing_mode="stretch_both")
+            return figure
+
+        compute, scheduler, workers = map(
+            profile_to_figure, (compute, scheduler, workers)
+        )
+
+        # Task stream
+        task_stream = self.get_task_stream(start=start)
+        from .diagnostics.task_stream import rectangles
+        from .dashboard.components.scheduler import task_stream_figure
+
+        rects = rectangles(task_stream)
+        source, task_stream = task_stream_figure(sizing_mode="stretch_both")
+        source.data.update(rects)
+
+        from distributed.dashboard.components.scheduler import (
+            BandwidthWorkers,
+            BandwidthTypes,
+        )
+
+        bandwidth_workers = BandwidthWorkers(self, sizing_mode="stretch_both")
+        bandwidth_workers.update()
+        bandwidth_types = BandwidthTypes(self, sizing_mode="stretch_both")
+        bandwidth_types.update()
+
+        from bokeh.models import Panel, Tabs
+
+        compute = Panel(child=compute, title="Worker Profile (compute)")
+        workers = Panel(child=workers, title="Worker Profile (administrative)")
+        scheduler = Panel(child=scheduler, title="Scheduler Profile (administrative)")
+        task_stream = Panel(child=task_stream, title="Task Stream")
+        bandwidth_workers = Panel(
+            child=bandwidth_workers.fig, title="Bandwidth (Workers)"
+        )
+        bandwidth_types = Panel(child=bandwidth_types.fig, title="Bandwidth (Types)")
+
+        tabs = Tabs(
+            tabs=[
+                task_stream,
+                compute,
+                workers,
+                scheduler,
+                bandwidth_workers,
+                bandwidth_types,
+            ]
+        )
+
+        from bokeh.plotting import save
+
+        with tmpfile(extension=".html") as fn:
+            save(tabs, filename=fn)
+
+            with open(fn) as f:
+                data = f.read()
+
+        return data
 
     async def get_worker_logs(self, comm=None, n=None, workers=None, nanny=False):
         results = await self.broadcast(
