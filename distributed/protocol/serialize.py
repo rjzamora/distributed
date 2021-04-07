@@ -1,4 +1,5 @@
 import importlib
+import threading
 import traceback
 from array import array
 from enum import Enum
@@ -8,8 +9,9 @@ import msgpack
 
 import dask
 from dask.base import normalize_token
+from dask.compatibility import apply
 
-from ..utils import ensure_bytes, has_keyword, typename
+from ..utils import LRU, ensure_bytes, has_keyword, typename
 from . import pickle
 from .compression import decompress, maybe_compress
 from .utils import frame_split_size, msgpack_opts, pack_frames_prelude, unpack_frames
@@ -196,7 +198,59 @@ def check_dask_serializable(x):
     return False
 
 
-def serialize(x, serializers=None, on_error="message", context=None):
+# Function caching for `serialize_task`
+cache_dumps = LRU(maxsize=100)
+_cache_lock = threading.Lock()
+
+
+def serialize_function(func):
+    try:
+        with _cache_lock:
+            header, frames = cache_dumps[func]
+    except KeyError:
+        header, frames = serialize(func)
+        if len(frames[0]) < 100000:
+            with _cache_lock:
+                cache_dumps[func] = (header, frames)
+    except TypeError:  # Unhashable function
+        header, frames = serialize(func)
+    return header, frames
+
+
+def serialize_task(x, serializers=None, on_error="message", context=None):
+    headers_frames = []
+    if x[0] is apply:
+        iterate_collection = True
+        nfuncs = 2
+    else:
+        iterate_collection = None
+        nfuncs = 1
+
+    for func in x[:nfuncs]:
+        headers_frames.append(serialize_function(func))
+
+    for obj in x[nfuncs:]:
+        headers_frames.append(
+            serialize(
+                obj,
+                serializers=serializers,
+                on_error=on_error,
+                context=context,
+                iterate_collection=iterate_collection,
+            )
+        )
+
+    return headers_frames
+
+
+def serialize(
+    x,
+    serializers=None,
+    on_error="message",
+    context=None,
+    task=None,
+    iterate_collection=None,
+):
     r"""
     Convert object to a header and list of bytestrings
 
@@ -209,6 +263,12 @@ def serialize(x, serializers=None, on_error="message", context=None):
     to the de/serialize functions. The name 'dask' is special, and will use the
     per-class serialization methods. ``None`` gives the default list
     ``['dask', 'pickle']``.
+
+    Notes on the ``iterate_collection`` argument (only relevant when
+    ``x`` is a collection):
+    - ``iterate_collection=True``: Serialize collection elements separately.
+    - ``iterate_collection=False``: Serialize collection elements together.
+    - ``iterate_collection=None`` (default): Infer the best setting.
 
     Examples
     --------
@@ -238,8 +298,11 @@ def serialize(x, serializers=None, on_error="message", context=None):
     if isinstance(x, Serialized):
         return x.header, x.frames
 
-    if type(x) in (list, set, tuple, dict):
-        iterate_collection = False
+    # Use special handling if this is a task
+    if task and iterate_collection is not False:
+        iterate_collection = True
+
+    if iterate_collection is None and type(x) in (list, set, tuple, dict):
         if type(x) is list and "msgpack" in serializers:
             # Note: "msgpack" will always convert lists to tuples
             #       (see GitHub #3716), so we should iterate
@@ -276,6 +339,10 @@ def serialize(x, serializers=None, on_error="message", context=None):
                 )
                 _header["key"] = k
                 headers_frames.append((_header, _frames))
+        elif task:
+            headers_frames = serialize_task(
+                x, serializers=serializers, on_error=on_error, context=context
+            )
         else:
             headers_frames = [
                 serialize(
@@ -300,6 +367,10 @@ def serialize(x, serializers=None, on_error="message", context=None):
             "frame-lengths": lengths,
             "type-serialized": type(x).__name__,
         }
+        if task:
+            headers["task"] = True
+            if x[0] is apply:
+                headers["apply"] = True
         if any(compression is not None for compression in compressions):
             headers["compression"] = compressions
         return headers, frames
@@ -329,6 +400,44 @@ def serialize(x, serializers=None, on_error="message", context=None):
         return {"serializer": "error"}, frames
     elif on_error == "raise":
         raise TypeError(msg, str(x)[:10000])
+
+
+# Function caching for `deserialize_task`
+cache_loads = LRU(maxsize=100)
+
+
+def deserialize_function(header, frames):
+    if len(frames[0]) < 100000:
+        try:
+            result = cache_loads[frames[0]]
+        except KeyError:
+            result = deserialize(header, frames)
+            cache_loads[frames[0]] = result
+        return result
+    return deserialize(header, frames)
+
+
+def deserialize_task(headers, frames, lengths, deserializers, is_apply):
+    lst = [apply] if is_apply else []
+    start = 0
+    lst.append(
+        deserialize_function(
+            headers[0],
+            frames[start : start + lengths[0]],
+        )
+    )
+    start += lengths[0]
+
+    for _header, _length in zip(headers[1:], lengths[1:]):
+        lst.append(
+            deserialize(
+                _header,
+                frames[start : start + _length],
+                deserializers=deserializers,
+            )
+        )
+        start += _length
+    return lst
 
 
 def deserialize(header, frames, deserializers=None):
@@ -366,6 +475,12 @@ def deserialize(header, frames, deserializers=None):
                 )
                 start += _length
             return d
+        elif header.get("task", False):
+            return cls(
+                deserialize_task(
+                    headers, frames, lengths, deserializers, header.get("apply", False)
+                )
+            )
         else:
             lst = []
             for _header, _length in zip(headers, lengths):
@@ -389,7 +504,9 @@ def deserialize(header, frames, deserializers=None):
     return loads(header, frames)
 
 
-def serialize_and_split(x, serializers=None, on_error="message", context=None):
+def serialize_and_split(
+    x, serializers=None, on_error="message", context=None, task=None
+):
     """Serialize and split compressable frames
 
     This function is a drop-in replacement of `serialize()` that calls `serialize()`
@@ -402,7 +519,9 @@ def serialize_and_split(x, serializers=None, on_error="message", context=None):
     serialize
     merge_and_deserialize
     """
-    header, frames = serialize(x, serializers, on_error, context)
+    header, frames = serialize(
+        x, serializers, on_error, context, iterate_collection=task
+    )
     num_sub_frames = []
     offsets = []
     out_frames = []
@@ -469,8 +588,9 @@ class Serialize:
     distributed.protocol.dumps
     """
 
-    def __init__(self, data):
+    def __init__(self, data, task=None):
         self.data = data
+        self.task = task
 
     def __repr__(self):
         return "<Serialize: %s>" % str(self.data)

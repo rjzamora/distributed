@@ -48,14 +48,20 @@ def dumps(msg, serializers=None, on_error="message", context=None) -> list:
         def _encode_default(obj):
             typ = type(obj)
             if typ is Serialize or typ is Serialized:
+                is_task = None
                 if typ is Serialize:
+                    is_task = obj.task
                     obj = obj.data
                 offset = len(frames)
                 if typ is Serialized:
                     sub_header, sub_frames = obj.header, obj.frames
                 else:
                     sub_header, sub_frames = serialize_and_split(
-                        obj, serializers=serializers, on_error=on_error, context=context
+                        obj,
+                        serializers=serializers,
+                        on_error=on_error,
+                        context=context,
+                        task=is_task,
                     )
                     _inplace_compress_frames(sub_header, sub_frames)
                 sub_header["num-sub-frames"] = len(sub_frames)
