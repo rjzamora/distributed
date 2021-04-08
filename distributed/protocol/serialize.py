@@ -1,4 +1,5 @@
 import importlib
+import threading
 import traceback
 from array import array
 from enum import Enum
@@ -8,8 +9,10 @@ import msgpack
 
 import dask
 from dask.base import normalize_token
+from dask.compatibility import apply
+from dask.core import istask
 
-from ..utils import ensure_bytes, has_keyword, typename
+from ..utils import LRU, ensure_bytes, has_keyword, typename
 from . import pickle
 from .compression import decompress, maybe_compress
 from .utils import frame_split_size, msgpack_opts, pack_frames_prelude, unpack_frames
@@ -196,6 +199,66 @@ def check_dask_serializable(x):
     return False
 
 
+def check_likely_task(x):
+    if not (isinstance(x, tuple) and x):
+        # Definitely not a task
+        return False
+    if istask(x):
+        # Definitely a task if this is True, but `istask`
+        # will return False if the function is serialized
+        return True
+    if isinstance(x[0], Serialize):
+        # Definitely a task if the data attr is callable
+        return callable(x[0].data)
+    # Possibly a task if the 0th element is Serialized
+    return isinstance(x[0], Serialized)
+
+
+# Function caching for `serialize_task`
+cache_dumps = LRU(maxsize=100)
+_cache_lock = threading.Lock()
+
+
+def serialize_function(func):
+    try:
+        with _cache_lock:
+            header, frames = cache_dumps[func]
+    except KeyError:
+        header, frames = serialize(func)
+        if len(frames[0]) < 100000:
+            with _cache_lock:
+                cache_dumps[func] = (header, frames)
+    except TypeError:  # Unhashable function
+        header, frames = serialize(func)
+    return header, frames
+
+
+def serialize_task(x, serializers=None, on_error="message", context=None):
+    headers_frames = []
+    if x[0] is apply:
+        iterate_collection = True
+        nfuncs = 2
+    else:
+        iterate_collection = None
+        nfuncs = 1
+
+    for func in x[:nfuncs]:
+        headers_frames.append(serialize_function(func))
+
+    for obj in x[nfuncs:]:
+        headers_frames.append(
+            serialize(
+                obj,
+                serializers=serializers,
+                on_error=on_error,
+                context=context,
+                iterate_collection=iterate_collection,
+            )
+        )
+
+    return headers_frames
+
+
 def serialize(
     x, serializers=None, on_error="message", context=None, iterate_collection=None
 ):
@@ -256,6 +319,13 @@ def serialize(
             iterate_collection=iterate_collection,
         )
 
+    # Special handling if this is likely a task
+    assume_task = False
+    if iterate_collection is not False:
+        assume_task = check_likely_task(x)
+        if assume_task:
+            iterate_collection = True
+
     if iterate_collection is None and type(x) in (list, set, tuple, dict):
         if type(x) is list and "msgpack" in serializers:
             # Note: "msgpack" will always convert lists to tuples
@@ -293,6 +363,10 @@ def serialize(
                 )
                 _header["key"] = k
                 headers_frames.append((_header, _frames))
+        elif assume_task:
+            headers_frames = serialize_task(
+                x, serializers=serializers, on_error=on_error, context=context
+            )
         else:
             headers_frames = [
                 serialize(
