@@ -3476,9 +3476,9 @@ def _deserialize(function=None, args=None, kwargs=None, task=no_value):
     """ Deserialize task inputs and regularize to func, args, kwargs """
     if function is not None:
         function = loads_function(function)
-    if args and isinstance(args, bytes):
+    if args:
         args = pickle.loads(args)
-    if kwargs and isinstance(kwargs, bytes):
+    if kwargs:
         kwargs = pickle.loads(kwargs)
 
     if task is not no_value:
