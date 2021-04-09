@@ -243,7 +243,8 @@ def serialize_task(x, serializers=None, on_error="message", context=None):
         nfuncs = 1
 
     for func in x[:nfuncs]:
-        headers_frames.append(serialize_function(func))
+        if func is not apply:
+            headers_frames.append(serialize_function(func))
 
     for obj in x[nfuncs:]:
         headers_frames.append(
@@ -391,6 +392,10 @@ def serialize(
             "frame-lengths": lengths,
             "type-serialized": type(x).__name__,
         }
+        if assume_task:
+            headers["task"] = True
+            if x[0] is apply:
+                headers["apply"] = True
         if any(compression is not None for compression in compressions):
             headers["compression"] = compressions
         return headers, frames
@@ -420,6 +425,47 @@ def serialize(
         return {"serializer": "error"}, frames
     elif on_error == "raise":
         raise TypeError(msg, str(x)[:10000])
+
+
+# Function caching for `deserialize_task`
+cache_loads = LRU(maxsize=100)
+
+
+def deserialize_function(header, frames):
+    byte_obj = bytes(frames[0])
+    if len(byte_obj) < 100000:
+        try:
+            result = cache_loads[byte_obj]
+        except KeyError:
+            result = deserialize(header, frames)
+            cache_loads[byte_obj] = result
+        return result
+    return deserialize(header, frames)
+
+
+def deserialize_task(headers, frames, lengths, deserializers, is_apply):
+    lst = [apply] if is_apply else []
+    start = 0
+    _first = True
+    for _header, _length in zip(headers, lengths):
+        if _first:
+            lst.append(
+                deserialize_function(
+                    _header,
+                    frames[start : start + _length],
+                )
+            )
+            _first = False
+        else:
+            lst.append(
+                deserialize(
+                    _header,
+                    frames[start : start + _length],
+                    deserializers=deserializers,
+                )
+            )
+        start += _length
+    return lst
 
 
 def deserialize(header, frames, deserializers=None):
@@ -457,6 +503,12 @@ def deserialize(header, frames, deserializers=None):
                 )
                 start += _length
             return d
+        elif header.get("task", False):
+            return tuple(
+                deserialize_task(
+                    headers, frames, lengths, deserializers, header.get("apply", False)
+                )
+            )
         else:
             lst = []
             for _header, _length in zip(headers, lengths):
