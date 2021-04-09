@@ -10,7 +10,6 @@ import msgpack
 import dask
 from dask.base import normalize_token
 from dask.compatibility import apply
-from dask.core import istask
 
 from ..utils import LRU, ensure_bytes, has_keyword, typename
 from . import pickle
@@ -199,21 +198,6 @@ def check_dask_serializable(x):
     return False
 
 
-def check_likely_task(x):
-    if not (isinstance(x, tuple) and x):
-        # Definitely not a task
-        return False
-    if istask(x):
-        # Definitely a task if this is True, but `istask`
-        # will return False if the function is serialized
-        return True
-    if isinstance(x[0], Serialize):
-        # Definitely a task if the data attr is callable
-        return callable(x[0].data)
-    # Possibly a task if the 0th element is Serialized
-    return isinstance(x[0], Serialized)
-
-
 # Function caching for `serialize_task`
 cache_dumps = LRU(maxsize=100)
 _cache_lock = threading.Lock()
@@ -261,7 +245,12 @@ def serialize_task(x, serializers=None, on_error="message", context=None):
 
 
 def serialize(
-    x, serializers=None, on_error="message", context=None, iterate_collection=None
+    x,
+    serializers=None,
+    on_error="message",
+    context=None,
+    iterate_collection=None,
+    is_task=False,
 ):
     r"""
     Convert object to a header and list of bytestrings
@@ -320,12 +309,13 @@ def serialize(
             iterate_collection=iterate_collection,
         )
 
-    # Special handling if this is likely a task
-    assume_task = False
-    if iterate_collection is not False:
-        assume_task = check_likely_task(x)
-        if assume_task:
-            iterate_collection = True
+    # Special handling if this is a task
+    if is_task:
+        if iterate_collection is False:
+            raise ValueError(
+                "Cannot set iterate_collection to False for task serialization"
+            )
+        iterate_collection = True
 
     if iterate_collection is None and type(x) in (list, set, tuple, dict):
         if type(x) is list and "msgpack" in serializers:
@@ -364,7 +354,7 @@ def serialize(
                 )
                 _header["key"] = k
                 headers_frames.append((_header, _frames))
-        elif assume_task:
+        elif is_task:
             headers_frames = serialize_task(
                 x, serializers=serializers, on_error=on_error, context=context
             )
@@ -392,7 +382,7 @@ def serialize(
             "frame-lengths": lengths,
             "type-serialized": type(x).__name__,
         }
-        if assume_task:
+        if is_task:
             headers["task"] = True
             if x[0] is apply:
                 headers["apply"] = True
@@ -533,7 +523,12 @@ def deserialize(header, frames, deserializers=None):
 
 
 def serialize_and_split(
-    x, serializers=None, on_error="message", context=None, iterate_collection=None
+    x,
+    serializers=None,
+    on_error="message",
+    context=None,
+    iterate_collection=None,
+    is_task=False,
 ):
     """Serialize and split compressable frames
 
@@ -548,7 +543,12 @@ def serialize_and_split(
     merge_and_deserialize
     """
     header, frames = serialize(
-        x, serializers, on_error, context, iterate_collection=iterate_collection
+        x,
+        serializers,
+        on_error,
+        context,
+        iterate_collection=iterate_collection,
+        is_task=is_task,
     )
     num_sub_frames = []
     offsets = []
@@ -616,11 +616,12 @@ class Serialize:
     distributed.protocol.dumps
     """
 
-    def __init__(self, data, iterate_collection=None):
+    def __init__(self, data, is_task=False, iterate_collection=None):
         self.data = data
-        # Optional `iterate_collection` argument will
+        # Optional `iterate_collection` and `is_task` arguments will
         # be passed down to `serialize` function.
         self.iterate_collection = iterate_collection
+        self.is_task = is_task
 
     def __repr__(self):
         return "<Serialize: %s>" % str(self.data)

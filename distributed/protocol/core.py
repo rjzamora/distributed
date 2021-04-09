@@ -49,8 +49,10 @@ def dumps(msg, serializers=None, on_error="message", context=None) -> list:
             typ = type(obj)
             if typ is Serialize or typ is Serialized:
                 iterate_collection = None
+                is_task = False
                 if typ is Serialize:
                     iterate_collection = obj.iterate_collection
+                    is_task = obj.is_task
                     obj = obj.data
                 offset = len(frames)
                 if typ is Serialized:
@@ -62,6 +64,7 @@ def dumps(msg, serializers=None, on_error="message", context=None) -> list:
                         on_error=on_error,
                         context=context,
                         iterate_collection=iterate_collection,
+                        is_task=is_task,
                     )
                     _inplace_compress_frames(sub_header, sub_frames)
                 sub_header["num-sub-frames"] = len(sub_frames)
