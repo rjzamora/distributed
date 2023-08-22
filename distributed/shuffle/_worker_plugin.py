@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, List, overload
 
 from dask.context import thread_state
 from dask.utils import parse_bytes
@@ -352,6 +353,7 @@ class ShuffleWorkerPlugin(WorkerPlugin):
         run_id: int,
         partition_id: int | NDIndex,
         meta: pd.DataFrame | None = None,
+        **kwargs,
     ) -> Any:
         """
         Task: Retrieve a shuffled output partition from the ShuffleWorkerPlugin.
@@ -366,4 +368,5 @@ class ShuffleWorkerPlugin(WorkerPlugin):
             partition_id=partition_id,
             key=key,
             meta=meta,
+            **kwargs,
         )

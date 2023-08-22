@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, List, Union
 
 import toolz
 
@@ -72,11 +72,21 @@ def shuffle_transfer(
 
 
 def shuffle_unpack(
-    id: ShuffleId, output_partition: int, barrier_run_id: int, meta: pd.DataFrame
+    id: ShuffleId,
+    output_partition: int,
+    barrier_run_id: int,
+    meta: pd.DataFrame,
+    convert_cb: Callable | None = None,
+    convert_args: list | None = None,
 ) -> pd.DataFrame:
     try:
         return get_worker_plugin().get_output_partition(
-            id, barrier_run_id, output_partition, meta=meta
+            id,
+            barrier_run_id,
+            output_partition,
+            meta=meta,
+            convert_cb=convert_cb,
+            convert_args=convert_args,
         )
     except Reschedule as e:
         raise e
@@ -471,6 +481,8 @@ class DataFrameShuffleRun(ShuffleRun[int, "pd.DataFrame"]):
         partition_id: int,
         key: str,
         meta: pd.DataFrame | None = None,
+        convert_cb: Callable | None = None,
+        convert_args: list | None = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
         self.raise_if_closed()
@@ -485,7 +497,8 @@ class DataFrameShuffleRun(ShuffleRun[int, "pd.DataFrame"]):
         try:
             data = self._read_from_disk((partition_id,))
 
-            out = await self.offload(convert_partition, data, meta)
+            convert_func = convert_cb or convert_partition
+            out = await self.offload(convert_func, data, meta, *(convert_args or []))
         except KeyError:
             out = meta.copy()
         return out
