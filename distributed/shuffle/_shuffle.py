@@ -39,7 +39,6 @@ from distributed.shuffle._core import (
     get_worker_plugin,
     handle_transfer_errors,
     handle_unpack_errors,
-    load_output_partition,
 )
 from distributed.shuffle._limiter import ResourceLimiter
 from distributed.shuffle._scheduler_plugin import ShuffleSchedulerPlugin
@@ -91,12 +90,12 @@ def shuffle_unpack(
         )
 
 
-def delayed_shuffle_unpack(
+def shuffle_unpack_partial(
     id: ShuffleId, output_partition: int, barrier_run_id: int
 ) -> pd.DataFrame:
     with handle_unpack_errors(id):
         return get_worker_plugin().get_output_partition(
-            id, barrier_run_id, output_partition, load=False
+            id, barrier_run_id, output_partition, convert=False
         )
 
 
@@ -151,10 +150,10 @@ def rearrange_by_column_p2p(
         meta,
         [None] * (npartitions + 1),
     ).map_partitions(
-        load_output_partition,
-        layer._tokens[1],
+        partial(_convert_output_partition, meta=meta),
         meta=meta,
         enforce_metadata=False,
+        align_dataframes=False,
     )
 
 
@@ -305,7 +304,7 @@ class P2PShuffleLayer(Layer):
         name = self.name
         for part_out in self.parts_out:
             dsk[(name, part_out)] = (
-                delayed_shuffle_unpack,
+                shuffle_unpack_partial,
                 token,
                 part_out,
                 _barrier_key,
@@ -519,13 +518,14 @@ class DataFrameShuffleRun(ShuffleRun[int, "pd.DataFrame"]):
         self,
         partition_id: int,
         key: Key,
+        convert: bool = True,
         **kwargs: Any,
     ) -> pd.DataFrame:
         try:
             data = self._read_from_disk((partition_id,))
-            return convert_shards(data, self.meta)
+            return convert_shards(data, self.meta) if convert else data
         except KeyError:
-            return self.meta.copy()
+            return self.meta.copy() if convert else None
 
     def _get_assigned_worker(self, id: int) -> str:
         return self.worker_for[id]
@@ -580,3 +580,7 @@ def _get_worker_for_range_sharding(
     """Get address of target worker for this output partition using range sharding"""
     i = len(workers) * output_partition // npartitions
     return workers[i]
+
+
+def _convert_output_partition(data: pa.Table, meta: Any = None) -> pd.DataFrame:
+    return meta.copy() if data is None else convert_shards(data, meta)
