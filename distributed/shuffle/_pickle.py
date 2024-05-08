@@ -57,6 +57,9 @@ def pickle_dataframe_shard(
     Parameters:
         obj: pandas
     """
+    if hasattr(shard, "to_pandas"):
+        # Handle cudf-backed data
+        shard = shard.to_pandas(nullable=True)
     return pickle_bytelist(
         (input_part_id, shard.index, *shard._mgr.blocks), prelude=False
     )
@@ -104,6 +107,9 @@ def unpickle_and_concat_dataframe_shards(
 
     # Actually load memory-mapped buffers into memory and close the file
     # descriptors
+    if hasattr(type(meta), "from_pandas"):
+        # Handle cudf-backed data
+        return type(meta).from_pandas(dd.methods.concat(shards, copy=True))
     return dd.methods.concat(shards, copy=True)
 
 

@@ -332,7 +332,7 @@ def split_by_worker(
     """
     out: defaultdict[str, list[tuple[int, list[PickleBuffer]]]] = defaultdict(list)
 
-    base = df[column].values.base  # type: ignore[union-attr]
+    base = df[column].values.base or [] # type: ignore[union-attr]
     for output_part_id, part in df.groupby(column, observed=True):
         assert isinstance(output_part_id, int)
         if output_part_id not in worker_for:
