@@ -3313,6 +3313,7 @@ class Client(SyncMethodMixin):
         retries=None,
         fifo_timeout=0,
         actors=None,
+        annotations_by_type=None,
     ):
         with self._refcount_lock:
             if actors is not None and actors is not True and actors is not False:
@@ -3380,6 +3381,7 @@ class Client(SyncMethodMixin):
                     "actors": actors,
                     "code": ToPickle(computations),
                     "annotations": ToPickle(annotations),
+                    "annotations_by_type": ToPickle(annotations_by_type or {}),
                     "span_metadata": ToPickle(span_metadata),
                 }
             )
@@ -3469,6 +3471,7 @@ class Client(SyncMethodMixin):
             user_priority=priority,
             actors=actors,
             span_metadata=SpanMetadata(collections=[{"type": "low-level-graph"}]),
+            annotations_by_type=kwargs.get("annotations_by_type", None),
         )
         packed = pack_data(keys, futures)
         if sync:
