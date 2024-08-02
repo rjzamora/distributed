@@ -4753,7 +4753,7 @@ class Scheduler(SchedulerState, ServerNode):
         fifo_timeout: float = 0.0,
         code: tuple[SourceCode, ...] = (),
         annotations: dict | None = None,
-        annotations_by_type: dict | None = None,
+        task_resources: dict | None = None,
         stimulus_id: str | None = None,
     ) -> None:
         start = time()
@@ -4772,15 +4772,17 @@ class Scheduler(SchedulerState, ServerNode):
             (
                 dsk,
                 dependencies,
-                _annotations_by_type,
+                annotations_by_type,
             ) = await offload(
                 _materialize_graph,
                 graph=graph,
                 global_annotations=annotations or {},
             )
             del graph
-            annotations_by_type = _annotations_by_type.update(annotations_by_type or {})
-            del _annotations_by_type
+
+            if task_resources:
+                annotations_by_type["resources"].update(task_resources)
+
             if not internal_priority:
                 # Removing all non-local keys before calling order()
                 dsk_keys = set(
